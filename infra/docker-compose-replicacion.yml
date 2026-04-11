@@ -1,0 +1,15 @@
+# Este archivo se usó con ligeras variaciones (master/slave) en los 3 nodos
+version: '3.8'
+services:
+  pg_node:
+    image: bitnami/postgresql:latest
+    ports:
+      - "5433:5432"
+    environment:
+      # En el Primary era 'master', en las réplicas era 'slave'
+      - POSTGRESQL_REPLICATION_MODE=master 
+      - POSTGRESQL_REPLICATION_USER=repl_user
+      - POSTGRESQL_REPLICATION_PASSWORD=repl_password
+      - POSTGRESQL_USERNAME=admin
+      - POSTGRESQL_PASSWORD=password
+      - POSTGRESQL_DATABASE=banco_db
