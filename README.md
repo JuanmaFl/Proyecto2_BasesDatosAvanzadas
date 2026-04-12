@@ -71,6 +71,8 @@ La arquitectura se desplegó en **Amazon Web Services (AWS)** utilizando 3 insta
 │                   Red VPC — us-east-1b                       │
 └──────────────────────────────────────────────────────────────┘
 
+```
+
 **Nota Técnica sobre el Enrutamiento (El reto de las IPs):**
 Durante el desarrollo, tomamos la decisión arquitectónica y financiera de **no utilizar IPs Elásticas**. En entornos de producción reales, un cambio de IP es inaceptable y se mitiga mediante DNS (Route 53) o IPs estáticas. Sin embargo, en el entorno académico (Vocareum/AWS Academy), las IPs elásticas conllevan cobros por inactividad cuando las máquinas se detienen para ahorrar créditos. 
 
