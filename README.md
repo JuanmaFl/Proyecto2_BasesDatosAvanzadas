@@ -9,21 +9,65 @@
 ## 1. Introducción y Objetivo
 El volumen masivo de datos modernos ha llevado a las bases de datos al límite de la escalabilidad vertical. La solución estándar es distribuir la carga, pero esto introduce una complejidad extrema en términos de consistencia, latencia y tolerancia a fallos. 
 
-El objetivo de este proyecto es diseñar, implementar y evaluar una arquitectura de base de datos distribuida para analizar empíricamente los compromisos (*trade-offs*) descritos por el Teorema CAP y el modelo PACELC. Para ello, contrastamos la configuración manual en un motor SQL clásico (**PostgreSQL**) frente al comportamiento automatizado de un motor NewSQL nativo de la nube (**CockroachDB**).
+El objetivo de este proyecto es diseñar, implementar y evaluar una arquitectura de base de datos distribuida para analizar empíricamente los compromisos (*trade-offs*) descritos por el Teorema CAP y el modelo PACELC. 
+
+Para ello, contrastamos la configuración manual en un motor SQL clásico (**PostgreSQL**) en relación al comportamiento automatizado de un motor NewSQL nativo de la nube (**CockroachDB**).
 
 ## 2. Contexto del Problema: Dominio Bancario
-Seleccionamos el dominio de la **Banca (Cuentas y Transferencias)** debido a su estricta necesidad de consistencia transaccional (ACID). 
+Seleccionamos el dominio de la **Banca (Cuentas y Transferencias)** por su estricta necesidad de consistencia transaccional (ACID). 
+
 * **Modelo de Datos:** Tablas de clientes y cuentas bancarias.
+  * cuentas: cuenta_id, cliente_id, pais, saldo.
+  * clientes: cliente_id, nombre.
+  
 * **Geodistribución:** Simulamos operaciones financieras divididas geográficamente en tres regiones: Colombia, México y España.
+| Nodo | IP (AWS) | Región | Rol en PostgreSQL | Rol en CockroachDB |
+|------|----------|--------|-------------------|--------------------|
+| Nodo 1 | 100.53.191.219 | Colombia | Coordinador / Primary | Nodo activo (Leaseholder inicial) |
+| Nodo 2 | 98.93.43.92 | México | Fragmento remoto / Réplica | Nodo activo |
+| Nodo 3 | 54.145.59.62 | España | Fragmento remoto / Réplica | Nodo activo |
+
 * **Volumen:** Se inyectaron mediante scripts generadores de datos sintéticos decenas de miles de registros para forzar al motor a demostrar su capacidad de particionamiento y enrutamiento en consultas analíticas (OLAP) y transaccionales (OLTP).
+| Tabla | Registros | Estrategia |
+|-------|-----------|-----------|
+| `cuentas` | 30.001 | LIST por país (~10.000 por nodo) |
+| `clientes` | 30.004 | Local en coordinador |
+
+---
 
 ## 3. Arquitectura de la Solución e Infraestructura
 
 La arquitectura se desplegó en **Amazon Web Services (AWS)** utilizando 3 instancias EC2 (`t2.micro`) con Docker, representando nuestros 3 nodos geográficos.
 
+┌──────────────────────────────────────────────────────────────┐
+│                    AWS — us-east-1b                          │
+│                                                              │
+│  ┌──────────────────┐  ┌─────────────────┐  ┌─────────────┐ │
+│  │    Nodo 1        │  │    Nodo 2       │  │   Nodo 3    │ │
+│  │   Colombia       │  │    México       │  │   España    │ │
+│  │ 100.53.191.219   │  │  98.93.43.92   │  │ 54.145.59.62│ │
+│  │   t2.micro       │  │   t2.micro     │  │   t2.micro  │ │
+│  │                  │  │                │  │             │ │
+│  │  ┌────────────┐  │  │ ┌───────────┐  │  │ ┌─────────┐ │ │
+│  │  │ PostgreSQL │  │  │ │PostgreSQL │  │  │ │Postgres │ │ │
+│  │  │(Coordinador│  │  │ │ (Réplica/ │  │  │ │(Réplica/│ │ │
+│  │  │  /Primary) │  │  │ │ Fragmento)│  │  │ │Fragment)│ │ │
+│  │  └────────────┘  │  │ └───────────┘  │  │ └─────────┘ │ │
+│  │  ┌────────────┐  │  │ ┌───────────┐  │  │ ┌─────────┐ │ │
+│  │  │CockroachDB │  │  │ │CockroachDB│  │  │ │Cockroach│ │ │
+│  │  │  v23.1.14  │◄─┼──┼►│ v23.1.14  │◄─┼──┼►│v23.1.14 │ │ │
+│  │  │  (Raft)    │  │  │ │  (Raft)   │  │  │ │ (Raft)  │ │ │
+│  │  └────────────┘  │  │ └───────────┘  │  │ └─────────┘ │ │
+│  └──────────────────┘  └─────────────────┘  └─────────────┘ │
+│                                                              │
+│                    Red VPC — us-east-1b                      │
+└──────────────────────────────────────────────────────────────┘
+
 **Nota Técnica sobre el Enrutamiento (El reto de las IPs):**
 Durante el desarrollo, tomamos la decisión arquitectónica y financiera de **no utilizar IPs Elásticas**. En entornos de producción reales, un cambio de IP es inaceptable y se mitiga mediante DNS (Route 53) o IPs estáticas. Sin embargo, en el entorno académico (Vocareum/AWS Academy), las IPs elásticas conllevan cobros por inactividad cuando las máquinas se detienen para ahorrar créditos. 
+
 Dado que apagábamos la infraestructura al finalizar cada sesión de trabajo, **las instancias cambiaban de IP pública al reiniciarse**. Esto nos obligó a:
+
 1. Actualizar dinámicamente los esquemas de red en PostgreSQL usando comandos `ALTER SERVER`.
 2. Re-unir los nodos en CockroachDB ajustando los parámetros `--advertise-addr` tras cada reinicio.
 Esta restricción, aunque tediosa operativamente, nos permitió comprender a bajo nivel cómo se establecen los túneles de comunicación TCP/IP entre fragmentos distribuidos.
@@ -35,8 +79,8 @@ Esta restricción, aunque tediosa operativamente, nos permitió comprender a baj
 ### Fase 1 y 2: El enfoque Clásico (PostgreSQL) - Sharding y 2PC
 Enfrentamos la complejidad de distribuir datos en un motor que no es distribuido nativamente.
 * **Sharding Manual:** Utilizamos `postgres_fdw` para particionar horizontalmente la tabla de cuentas según el país. La lógica de enrutamiento quedó del lado del coordinador (Nodo Colombia).
-* **El Reto del Join Distribuido:** Al cruzar la tabla local de `clientes` con la distribuida de `cuentas`, el `EXPLAIN ANALYZE` demostró el alto costo de red de los *Foreign Scans*.
-* **Transacciones Distribuidas:** Implementamos manualmente el protocolo **Two-Phase Commit (2PC)** para simular una transferencia internacional. Ejecutamos `PREPARE TRANSACTION` en México y España antes de confirmar. Comprobamos críticamente que, si el coordinador cae en este punto, los recursos quedan bloqueados (lock), penalizando la disponibilidad.
+* **El Reto del Join Distribuido:** Al cruzar la tabla local de `clientes` con la distribuida de `cuentas`, el `EXPLAIN ANALYZE` demostró el alto costo de red de los *Foreign Scans*, los cuales confirman que PostgreSQL delega el filtro a los nodos remotos, pero los resultados viajan primero por red antes de ejecutar el `Nested Loop` de forma local.
+* **Transacciones Distribuidas:** Implementamos manualmente el protocolo **Two-Phase Commit (2PC)** para simular una transferencia internacional. Ejecutamos `PREPARE TRANSACTION` en México y España antes de confirmar. Comprobamos críticamente que, si el coordinador cae en este punto, los recursos quedan bloqueados (lock), penalizando la disponibilidad. Sin coordinador no podemos resolver automaticmante la incertidumbre, por lo que hay que intervenir manuelmente con `COMMIT PREPARED` o `ROLLBACK PREPARED`.
 
 ### Fase 3: Replicación, Latencia y CAP (PostgreSQL)
 Desplegamos una topología Líder-Seguidor.
