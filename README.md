@@ -116,7 +116,204 @@ Desplegamos una topología Líder-Seguidor.
 
 ---
 
-## 6. Análisis Crítico y Conclusiones del Equipo
+## 6. Análisis de Resultados Experimentales y Conclusiones del Equipo
+
+### 6.1 Distribución de Datos y Eficiencia del Sharding
+
+Los resultados de la inserción masiva de datos evidencian una distribución prácticamente uniforme de los registros entre los nodos geográficos, con aproximadamente **10,000 cuentas por país**. Esto valida que la estrategia de particionamiento por lista (`LIST`) basada en el atributo `pais` permite un balance adecuado de carga.
+
+Sin embargo, esta eficiencia en almacenamiento no se traduce directamente en eficiencia en consulta. El análisis del `EXPLAIN ANALYZE` del `JOIN` distribuido revela un comportamiento crítico: el motor ejecuta múltiples operaciones de tipo `Foreign Scan`, lo que implica que los datos deben ser recuperados desde nodos remotos antes de completar el `Nested Loop` localmente.
+
+El tiempo total de ejecución (**~65.668 ms**) es significativamente mayor al esperado para una consulta local, lo que evidencia que:
+
+* El costo dominante no es computacional, sino **latencia de red**.
+* PostgreSQL **no optimiza globalmente consultas distribuidas**, sino que delega ejecución parcial y luego centraliza el procesamiento.
+* El coordinador se convierte en un **cuello de botella lógico**.
+
+Esto confirma el principio de PACELC:
+
+| En ausencia de partición (Else), el sistema sacrifica latencia (L) debido a la distribución física de los datos.
+
+### 6.2 Transacciones Distribuidas y Consistencia (2PC)
+
+La implementación del protocolo **Two-Phase Commit (2PC)** demuestra correctamente la capacidad de mantener propiedades ACID en un entorno distribuido.
+
+Durante la fase de preparación (`PREPARE TRANSACTION`), se observa que:
+
+* Las operaciones en México (débito) y España (crédito) quedan en estado intermedio.
+* Los recursos permanecen **bloqueados** hasta que el coordinador decide el `COMMIT`.
+
+Tras la ejecución final, los resultados reflejan consistencia global en los saldos, confirmando que:
+
+* La **atomicidad distribuida se cumple correctamente**.
+* No existen estados intermedios visibles para el usuario.
+
+No obstante, este modelo introduce un trade-off crítico:
+
+* Si el nodo coordinador falla después del `PREPARE`, las transacciones quedan en estado incierto.
+* Esto genera **bloqueo de recursos (locks persistentes)** y requiere intervención manual.
+
+Este comportamiento evidencia directamente el modelo CAP:
+
+* PostgreSQL prioriza **Consistencia (C)** sobre **Disponibilidad (A)**.
+* Ante fallos, el sistema no puede progresar automáticamente.
+
+### 6.3 Replicación y Trade-off Consistencia vs Latencia (CAP)
+
+El experimento de latencia muestra una diferencia clara:
+
+* Escritura asíncrona: **~2.3 ms**
+* Escritura síncrona: **~5.15 ms**
+
+Esto implica un incremento de más del **120% en latencia** al exigir confirmación de réplica.
+
+La razón técnica es que en modo síncrono:
+
+* El nodo primario debe esperar confirmación de escritura física en al menos una réplica remota.
+* La latencia de red entre nodos (AWS) se vuelve parte del tiempo de commit.
+
+Esto confirma empíricamente:
+
+* La consistencia fuerte en sistemas distribuidos tiene un costo directo en rendimiento.
+* El throughput del sistema se ve afectado negativamente al aumentar el número de réplicas síncronas.
+
+Desde la perspectiva PACELC:
+
+* **ELC (Else Latency vs Consistency)** → PostgreSQL permite elegir:
+  * Baja latencia (asincrónico, eventual consistency)
+  * Alta consistencia (sincrónico, mayor latencia)
+ 
+### 6.4 Restricciones Operativas y Modelo Primary-Replica
+
+El intento de escritura en un nodo réplica genera el error:
+
+| `"cannot execute INSERT in a read-only transaction"`
+
+Esto valida que:
+
+* PostgreSQL implementa un modelo **Single-Writer (Primary)**.
+* Las réplicas son estrictamente de solo lectura.
+
+Este diseño:
+
+* Simplifica la consistencia
+* Pero limita la escalabilidad en escritura
+
+En escenarios de alta concurrencia, esto implica:
+
+* El nodo primario se convierte en un **punto único de presión (write bottleneck)**.
+
+### 6.5 Tolerancia a Fallos y Failover
+
+El experimento de failover demuestra que, tras la caída del nodo primario:
+
+* Es necesario ejecutar manualmente `pg_ctl promote`.
+* Una vez promovido, el nodo acepta escrituras correctamente.
+
+Aunque el sistema logra recuperarse sin pérdida de datos, se identifican limitaciones importantes:
+
+* El tiempo de recuperación **(RTO)** depende del operador.
+* Existe riesgo de errores humanos durante la promoción.
+* No hay mecanismo automático de elección de líder.
+
+Esto implica que:
+
+* PostgreSQL es **fault-tolerant, pero no fault-resilient de forma autónoma**.
+
+## 6.6 Arquitectura NewSQL: Sharding y Replicación Transparente
+
+En CockroachDB, la inserción de datos y el análisis de `SHOW RANGES` evidencian que:
+
+* El sistema distribuye automáticamente los datos en rangos.
+* Cada rango tiene réplicas en los nodos `{1,2,3}`.
+
+Esto elimina completamente:
+
+* La necesidad de definir particiones manuales
+* La lógica de enrutamiento en la aplicación
+
+Sin embargo, esta abstracción implica:
+
+* Overhead constante de replicación
+* Mayor consumo de recursos (CPU/RAM)
+
+### 6.7 Consistencia Distribuida mediante Raft
+
+A diferencia de PostgreSQL, CockroachDB no utiliza 2PC manual visible.
+
+En su lugar:
+
+* Implementa el protocolo de consenso **Raft**
+* Cada escritura requiere acuerdo de la mayoría (**quórum**)
+
+Esto permite:
+
+* Consistencia fuerte por defecto
+* Eliminación del coordinador central
+
+El trade-off es claro:
+
+* Mayor latencia base en comparación con escrituras locales
+* Pero sin riesgo de estados intermedios o bloqueos manuales
+
+### 6.8 Tolerancia a Fallos y Auto-Healing (CockroachDB)
+
+El experimento de caída de nodo demuestra que:
+
+* El sistema continúa operando sin interrupción (**Zero Downtime**)
+* Lecturas y escrituras siguen funcionando desde otros nodos
+* El clúster mantiene consistencia (conteo correcto de registros)
+
+Esto es posible porque:
+
+* Raft reelige automáticamente un líder de rango
+* El sistema mantiene quórum activo
+
+Comparado con PostgreSQL:
+
+| Característica | PostgreSQL (SQL Clásico) | CockroachDB (NewSQL) |
+| :--- | :--- | :--- |
+| Failover | Manual. | Automático. |
+| Tiempo de recuperación | Dependiente del operador. | Inmediato. |
+| Disponibilidad | Reducida durante el fallo. | Alta (si hay quórum). |
+
+Esto evidencia un diseño claramente orientado a:
+
+* **Alta disponibilidad sin intervención humana**
+* Sistemas distribuidos a escala real
+
+### 6.9 Síntesis Final: Validación Empírica de CAP y PACELC
+
+A partir de los resultados experimentales, se puede concluir:
+
+**PostgreSQL**
+* CAP: **CP (Consistencia + Tolerancia a partición)**
+* PACELC:
+  * P → sacrifica disponibilidad
+  * E → permite elegir entre latencia o consistencia
+* Ventaja: control total
+* Desventaja: alta complejidad operativa
+
+**CockroachDB**
+* CAP: **CP con alta disponibilidad percibida**
+* PACELC:
+  * P → mantiene consistencia con quórum
+  * E → sacrifica latencia para garantizar consistencia fuerte
+* Ventaja: automatización total
+* Desventaja: mayor costo computacional
+
+### Conclusión del análisis
+
+Los experimentos confirman que:
+
+* La distribución de datos introduce inevitablemente **latencia de red como factor dominante**
+* La consistencia fuerte en sistemas distribuidos **no es gratuita**
+* PostgreSQL expone explícitamente la complejidad del mundo distribuido
+* CockroachDB abstrae dicha complejidad, pero la internaliza mediante algoritmos de consenso
+
+En términos prácticos:
+
+| PostgreSQL ofrece control y eficiencia en entornos controlados, mientras que CockroachDB ofrece resiliencia y automatización para sistemas distribuidos a gran escala.
 
 1. **Impacto en Costos y Administración:** No todo lo que brilla es oro. Si bien CockroachDB eliminó la carga operativa de configurar Sharding y Failovers (que en Postgres nos tomó horas de configuración de archivos `.conf` y manejo de roles), este tipo de bases de datos NewSQL consumen considerablemente más memoria RAM y CPU para mantener los algoritmos de consenso (Raft) y la metradata distribuida. Para empresas pequeñas, el costo de infraestructura en la nube de un clúster NewSQL puede no justificar el beneficio frente a una instancia gestionada de Postgres (ej. AWS RDS).
 2. **La ilusión de la transparencia:** Las bases de datos NewSQL prometen abstracción total ("funciona como un Postgres normal"), pero como ingenieros comprobamos que ignorar la topología física subyacente es un error. Si un desarrollador hace un `JOIN` ineficiente en CockroachDB sin entender dónde residen los datos, el rendimiento colapsará por la latencia de red, igual que ocurrió en nuestro experimento con `postgres_fdw`.
