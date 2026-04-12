@@ -13,23 +13,30 @@ El objetivo de este proyecto es diseñar, implementar y evaluar una arquitectura
 
 Para ello, contrastamos la configuración manual en un motor SQL clásico (**PostgreSQL**) en relación al comportamiento automatizado de un motor NewSQL nativo de la nube (**CockroachDB**).
 
-## 2. Contexto del Problema: Dominio Bancario
-Seleccionamos el dominio de la **Banca (Cuentas y Transferencias)** por su estricta necesidad de consistencia transaccional (ACID). 
+---
 
-* **Modelo de Datos:** Tablas de clientes y cuentas bancarias.
-  * cuentas: cuenta_id, cliente_id, pais, saldo.
-  * clientes: cliente_id, nombre.
-  
-* **Geodistribución:** Simulamos operaciones financieras divididas geográficamente en tres regiones: Colombia, México y España.
+## 2. Contexto del Problema: Dominio Bancario
+
+Seleccionamos el dominio de la **Banca (Cuentas y Transferencias)** por su estricta necesidad de consistencia transaccional (ACID).
+
+### Modelo de Datos
+* **cuentas:** `cuenta_id`, `cliente_id`, `pais`, `saldo`.
+* **clientes:** `cliente_id`, `nombre`.
+
+### Geodistribución
+Simulamos operaciones financieras divididas geográficamente en tres regiones: Colombia, México y España.
+
 | Nodo | IP (AWS) | Región | Rol en PostgreSQL | Rol en CockroachDB |
-|------|----------|--------|-------------------|--------------------|
-| Nodo 1 | 100.53.191.219 | Colombia | Coordinador / Primary | Nodo activo (Leaseholder inicial) |
+| :--- | :--- | :--- | :--- | :--- |
+| Nodo 1 | 100.53.191.219 | Colombia | Coordinador / Primary | Nodo activo (Leaseholder) |
 | Nodo 2 | 98.93.43.92 | México | Fragmento remoto / Réplica | Nodo activo |
 | Nodo 3 | 54.145.59.62 | España | Fragmento remoto / Réplica | Nodo activo |
 
-* **Volumen:** Se inyectaron mediante scripts generadores de datos sintéticos decenas de miles de registros para forzar al motor a demostrar su capacidad de particionamiento y enrutamiento en consultas analíticas (OLAP) y transaccionales (OLTP).
+### Volumen de Datos
+Se inyectaron mediante scripts generadores de datos sintéticos decenas de miles de registros para forzar al motor a demostrar su capacidad de particionamiento y enrutamiento.
+
 | Tabla | Registros | Estrategia |
-|-------|-----------|-----------|
+| :--- | :--- | :--- |
 | `cuentas` | 30.001 | LIST por país (~10.000 por nodo) |
 | `clientes` | 30.004 | Local en coordinador |
 
@@ -37,30 +44,31 @@ Seleccionamos el dominio de la **Banca (Cuentas y Transferencias)** por su estri
 
 ## 3. Arquitectura de la Solución e Infraestructura
 
-La arquitectura se desplegó en **Amazon Web Services (AWS)** utilizando 3 instancias EC2 (`t2.micro`) con Docker, representando nuestros 3 nodos geográficos.
+La arquitectura se desplegó en **Amazon Web Services (AWS)** utilizando 3 instancias EC2 (`t2.micro`) con Docker.
 
+```text
 ┌──────────────────────────────────────────────────────────────┐
 │                    AWS — us-east-1b                          │
 │                                                              │
-│  ┌──────────────────┐  ┌─────────────────┐  ┌─────────────┐ │
-│  │    Nodo 1        │  │    Nodo 2       │  │   Nodo 3    │ │
-│  │   Colombia       │  │    México       │  │   España    │ │
-│  │ 100.53.191.219   │  │  98.93.43.92   │  │ 54.145.59.62│ │
-│  │   t2.micro       │  │   t2.micro     │  │   t2.micro  │ │
-│  │                  │  │                │  │             │ │
-│  │  ┌────────────┐  │  │ ┌───────────┐  │  │ ┌─────────┐ │ │
-│  │  │ PostgreSQL │  │  │ │PostgreSQL │  │  │ │Postgres │ │ │
-│  │  │(Coordinador│  │  │ │ (Réplica/ │  │  │ │(Réplica/│ │ │
-│  │  │  /Primary) │  │  │ │ Fragmento)│  │  │ │Fragment)│ │ │
-│  │  └────────────┘  │  │ └───────────┘  │  │ └─────────┘ │ │
-│  │  ┌────────────┐  │  │ ┌───────────┐  │  │ ┌─────────┐ │ │
-│  │  │CockroachDB │  │  │ │CockroachDB│  │  │ │Cockroach│ │ │
-│  │  │  v23.1.14  │◄─┼──┼►│ v23.1.14  │◄─┼──┼►│v23.1.14 │ │ │
-│  │  │  (Raft)    │  │  │ │  (Raft)   │  │  │ │ (Raft)  │ │ │
-│  │  └────────────┘  │  │ └───────────┘  │  │ └─────────┘ │ │
-│  └──────────────────┘  └─────────────────┘  └─────────────┘ │
+│  ┌──────────────────┐  ┌─────────────────┐  ┌─────────────┐  │
+│  │      Nodo 1      │  │      Nodo 2     │  │    Nodo 3   │  │
+│  │     Colombia     │  │      México     │  │    España   │  │
+│  │ 100.53.191.219   │  │  98.93.43.92    │  │ 54.145.59.62│  │
+│  │    t2.micro      │  │    t2.micro     │  │    t2.micro │  │
+│  │                  │  │                 │  │             │  │
+│  │  ┌────────────┐  │  │ ┌───────────┐   │  │ ┌─────────┐ │  │
+│  │  │ PostgreSQL │  │  │ │PostgreSQL │   │  │ │Postgres │ │  │
+│  │  │(Coordinador│  │  │ │ (Réplica/ │   │  │ │(Réplica/│ │  │
+│  │  │ /Primary)  │  │  │ │ Fragmento)│   │  │ │Fragment)│ │  │
+│  │  └────────────┘  │  │ └───────────┘   │  │ └─────────┘ │  │
+│  │  ┌────────────┐  │  │ ┌───────────┐   │  │ ┌─────────┐ │  │
+│  │  │CockroachDB │  │  │ │CockroachDB│   │  │ │Cockroach│ │  │
+│  │  │ v23.1.14   │◄─┼──┼►│ v23.1.14  │◄─┼──┼►│v23.1.14 │ │  │
+│  │  │  (Raft)    │  │  │ │  (Raft)   │   │  │ │ (Raft)  │ │  │
+│  │  └────────────┘  │  │ └───────────┘   │  │ └─────────┘ │  │
+│  └──────────────────┘  └─────────────────┘  └─────────────┘  │
 │                                                              │
-│                    Red VPC — us-east-1b                      │
+│                   Red VPC — us-east-1b                       │
 └──────────────────────────────────────────────────────────────┘
 
 **Nota Técnica sobre el Enrutamiento (El reto de las IPs):**
