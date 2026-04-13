@@ -324,3 +324,4 @@ En términos prácticos:
 * `/infra`: Archivos de configuración y `docker-compose.yml` utilizados para levantar las instancias.
 * `/scripts`: Scripts SQL conteniendo la lógica de creación de bases de datos, FDW, simulaciones masivas e implementación de 2PC.
 * `/Capturas`: [Ver el README interactivo de evidencias visuales aquí](./capturas/README.md) detallando las pruebas de latencia, planes de ejecución y failovers de ambos sistemas.
+* `/analisis_critico`: Analisis proyecto anexo.
